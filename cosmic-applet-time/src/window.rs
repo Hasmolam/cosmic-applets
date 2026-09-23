@@ -11,14 +11,14 @@ use cosmic::{
     iced::{
         Alignment, Length, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
-        platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
+        platform_specific::shell::wayland::commands::popup::destroy_popup,
         widget::{column, row, rule},
         window,
     },
     surface, theme,
     widget::{
         Button, Grid, Id, autosize, button, container, divider, grid, icon, rectangle_tracker::*,
-        space, text,
+        scrollable, space, text,
     },
 };
 use jiff::{
@@ -67,10 +67,10 @@ fn get_system_locale() -> Locale {
             }
 
             // Try language-only fallback (e.g., "en" from "en-US")
-            if let Some(lang) = cleaned_locale.split('-').next() {
-                if let Ok(locale) = Locale::try_from_str(lang) {
-                    return locale;
-                }
+            if let Some(lang) = cleaned_locale.split('-').next()
+                && let Ok(locale) = Locale::try_from_str(lang)
+            {
+                return locale;
             }
         }
     }
@@ -91,6 +91,12 @@ pub struct Window {
     config: TimeAppletConfig,
     show_seconds_tx: watch::Sender<bool>,
     locale: Locale,
+    calendar_backend: std::sync::Arc<dyn crate::event::CalendarBackend>,
+    event_cache: crate::event::EventCache,
+    is_loading_events: bool,
+    month_events: Vec<crate::event::CalendarEvent>,
+    month_event_dates: std::collections::HashSet<Date>,
+    selected_date_events: Vec<crate::event::CalendarEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +112,11 @@ pub enum Message {
     Token(TokenUpdate),
     ConfigChanged(TimeAppletConfig),
     TimezoneUpdate(String),
+    #[allow(dead_code)]
     Surface(surface::Action<Message>),
+    OpenUrl(String),
+    FetchEvents(Date),
+    EventsLoaded(Date, Result<Vec<crate::event::CalendarEvent>, String>),
 }
 
 impl Window {
@@ -171,8 +181,15 @@ impl Window {
             let is_month = date.first_of_month() == self.date_selected.first_of_month();
             let is_day = date == self.date_selected;
             let is_today = date == self.date_today;
+            let has_events = is_month && self.month_event_dates.contains(&date);
 
-            calendar = calendar.push(date_button(date.day(), is_month, is_day, is_today));
+            calendar = calendar.push(date_button(
+                date.day(),
+                is_month,
+                is_day,
+                is_today,
+                has_events,
+            ));
         }
 
         calendar
@@ -312,6 +329,154 @@ impl Window {
             .align_y(Alignment::Center),
         )
     }
+
+    fn format_event_time(&self, event: &crate::event::CalendarEvent) -> String {
+        if event.is_all_day {
+            return fl!("all-day");
+        }
+
+        let time_format = if self.config.military_time {
+            "%H:%M"
+        } else {
+            "%-I:%M %p"
+        };
+
+        let start_str = event.start.strftime(time_format).to_string();
+        let end_str = event.end.strftime(time_format).to_string();
+
+        format!("{start_str} - {end_str}")
+    }
+
+    fn events_view(&self) -> Element<'_, Message> {
+        let Spacing {
+            space_xs,
+            space_s,
+            space_m,
+            ..
+        } = theme::active().cosmic().spacing;
+
+        if self.is_loading_events && self.selected_date_events.is_empty() {
+            return container(text::caption(fl!("loading-events")))
+                .padding([space_s, space_m])
+                .center_x(Length::Fill)
+                .into();
+        }
+
+        if self.selected_date_events.is_empty() {
+            return container(text::caption(fl!("no-events-scheduled")))
+                .padding([space_s, space_m])
+                .center_x(Length::Fill)
+                .into();
+        }
+
+        let mut events_col = column![].spacing(space_xs);
+
+        for event in &self.selected_date_events {
+            let mut time_str = self.format_event_time(event);
+            if let Some(loc) = &event.location
+                && !loc.trim().is_empty()
+            {
+                time_str = format!("{time_str} • {loc}");
+            }
+
+            let summary = if event.summary.trim().is_empty() {
+                fl!("untitled-event")
+            } else {
+                event.summary.clone()
+            };
+
+            let color_strip = rule::vertical(3);
+
+            let details = column![
+                text::body(summary).size(13),
+                text::caption(time_str).size(11),
+            ]
+            .spacing(2)
+            .width(Length::Fill);
+
+            let mut event_row = row![color_strip, details]
+                .spacing(space_xs)
+                .align_y(Alignment::Center);
+
+            if let Some(url) = &event.url
+                && crate::event::is_safe_web_url(url)
+            {
+                let url_clone = url.clone();
+                event_row = event_row.push(
+                    button::icon(icon::from_name("link-symbolic"))
+                        .on_press(Message::OpenUrl(url_clone))
+                        .padding(4)
+                        .class(cosmic::theme::Button::Text),
+                );
+            }
+
+            events_col = events_col.push(container(event_row).padding(space_xs));
+        }
+
+        container(scrollable(events_col))
+            .max_height(200.0)
+            .into()
+    }
+
+    fn apply_events_for_month(&mut self, events: Vec<crate::event::CalendarEvent>) {
+        self.month_events = events;
+        self.month_event_dates = crate::event::covered_dates_for_events(&self.month_events);
+        self.selected_date_events =
+            crate::event::filter_events_for_date(&self.month_events, self.date_selected);
+        self.is_loading_events = false;
+    }
+
+    fn load_month_events(&mut self, date: Date) -> app::Task<Message> {
+        let year = date.year();
+        let month = date.month();
+        let is_stale = self.event_cache.is_stale(year, month);
+
+        if let Some(cached) = self.event_cache.get(year, month).cloned() {
+            self.apply_events_for_month(cached);
+            if is_stale {
+                self.fetch_events_task(date)
+            } else {
+                Task::none()
+            }
+        } else {
+            self.is_loading_events = true;
+            self.selected_date_events.clear();
+            self.fetch_events_task(date)
+        }
+    }
+
+    fn fetch_events_task(&self, date: Date) -> app::Task<Message> {
+        let backend = self.calendar_backend.clone();
+        let first_day_of_week = match self.config.first_day_of_week {
+            0 => Weekday::Monday,
+            1 => Weekday::Tuesday,
+            2 => Weekday::Wednesday,
+            3 => Weekday::Thursday,
+            4 => Weekday::Friday,
+            5 => Weekday::Saturday,
+            _ => Weekday::Sunday,
+        };
+
+        let first_day = get_calendar_first(date.year(), date.month(), first_day_of_week);
+        let last_day = first_day.checked_add(42.days()).unwrap_or(date);
+
+        Task::future(async move {
+            let res = backend.fetch_events(first_day, last_day).await;
+            match res {
+                Ok(events) => Message::EventsLoaded(date, Ok(events)),
+                Err(err) => Message::EventsLoaded(date, Err(err.to_string())),
+            }
+        })
+        .map(cosmic::Action::App)
+    }
+
+    #[allow(dead_code)]
+    pub fn set_calendar_backend(
+        &mut self,
+        backend: std::sync::Arc<dyn crate::event::CalendarBackend>,
+    ) {
+        self.calendar_backend = backend;
+    }
 }
 
 impl cosmic::Application for Window {
@@ -329,23 +494,42 @@ impl cosmic::Application for Window {
         // Synch `show_seconds` from the config within the time subscription
         let (show_seconds_tx, _) = watch::channel(true);
 
-        (
-            Self {
-                core,
-                popup: None,
-                now,
-                timezone: None,
-                date_today: today,
-                date_selected: today,
-                rectangle_tracker: None,
-                rectangle: Rectangle::default(),
-                token_tx: None,
-                config: TimeAppletConfig::default(),
-                show_seconds_tx,
-                locale,
-            },
-            Task::none(),
-        )
+        let calendar_backend: std::sync::Arc<dyn crate::event::CalendarBackend> =
+            if std::env::var("COSMIC_CALENDAR_MOCK").is_ok() {
+                std::sync::Arc::new(crate::event::MockBackend)
+            } else {
+                let local_backend =
+                    std::sync::Arc::new(crate::event::LocalIcsBackend::default_locations());
+                let eds_backend = std::sync::Arc::new(crate::event::EdsBackend::new());
+                std::sync::Arc::new(crate::event::CompositeBackend::new(vec![
+                    local_backend,
+                    eds_backend,
+                ]))
+            };
+
+        let window = Self {
+            core,
+            popup: None,
+            now,
+            timezone: None,
+            date_today: today,
+            date_selected: today,
+            rectangle_tracker: None,
+            rectangle: Rectangle::default(),
+            token_tx: None,
+            config: TimeAppletConfig::default(),
+            show_seconds_tx,
+            locale,
+            calendar_backend,
+            event_cache: crate::event::EventCache::new(),
+            is_loading_events: false,
+            month_events: Vec::new(),
+            month_event_dates: std::collections::HashSet::new(),
+            selected_date_events: Vec::new(),
+        };
+
+        // Zero Idle IPC: do not initiate background fetches until the popup is opened
+        (window, Task::none())
     }
 
     fn core(&self) -> &cosmic::app::Core {
@@ -361,7 +545,7 @@ impl cosmic::Application for Window {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        fn time_subscription(mut show_seconds: watch::Receiver<bool>) -> Subscription<Message> {
+        fn time_subscription(show_seconds: watch::Receiver<bool>) -> Subscription<Message> {
             struct Wrapper {
                 inner: watch::Receiver<bool>,
                 id: &'static str,
@@ -376,7 +560,7 @@ impl cosmic::Application for Window {
                     inner: show_seconds,
                     id: "time-sub",
                 },
-                |Wrapper { inner, id }| {
+                |Wrapper { inner, id: _ }| {
                     let mut show_seconds = inner.clone();
                     stream::channel(1, move |mut output: mpsc::Sender<Message>| async move {
                         // Mark this receiver's state as changed so that it always receives an initial
@@ -520,47 +704,68 @@ impl cosmic::Application for Window {
                 if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
-                    return cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-                        |_| Default::default(),
-                        |app: &mut Self| {
-                            app.date_today = app.now.date();
-                            app.date_selected = app.date_today;
+                    let popup_task =
+                        cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                            |_| Default::default(),
+                            |app: &mut Self| {
+                                app.date_today = app.now.date();
+                                app.date_selected = app.date_today;
+                                app.selected_date_events = crate::event::filter_events_for_date(
+                                    &app.month_events,
+                                    app.date_selected,
+                                );
 
-                            let new_id = window::Id::unique();
-                            app.popup = Some(new_id);
+                                let new_id = window::Id::unique();
+                                app.popup = Some(new_id);
 
-                            let mut popup_settings = app.core.applet.get_popup_settings(
-                                app.core.main_window_id().unwrap(),
-                                new_id,
-                                None,
-                                None,
-                                None,
-                            );
-                            let Rectangle {
-                                x,
-                                y,
-                                width,
-                                height,
-                            } = app.rectangle;
-                            popup_settings.positioner.anchor_rect = Rectangle::<i32> {
-                                x: x.max(1.) as i32,
-                                y: y.max(1.) as i32,
-                                width: width.max(1.) as i32,
-                                height: height.max(1.) as i32,
-                            };
+                                let mut popup_settings = app.core.applet.get_popup_settings(
+                                    app.core.main_window_id().unwrap(),
+                                    new_id,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                                let Rectangle {
+                                    x,
+                                    y,
+                                    width,
+                                    height,
+                                } = app.rectangle;
+                                popup_settings.positioner.anchor_rect = Rectangle::<i32> {
+                                    x: x.max(1.) as i32,
+                                    y: y.max(1.) as i32,
+                                    width: width.max(1.) as i32,
+                                    height: height.max(1.) as i32,
+                                };
 
-                            popup_settings.positioner.size = None;
-                            popup_settings
-                        },
-                        None,
-                    ));
+                                popup_settings.positioner.size = None;
+                                popup_settings
+                            },
+                            None,
+                        ));
+                    let fetch_task = self.load_month_events(self.date_selected);
+                    Task::batch([popup_task, fetch_task])
                 }
             }
             Message::Tick => {
-                self.now = self.timezone.as_ref().map_or_else(
-                    || Zoned::now(),
-                    |tz| Zoned::now().with_time_zone(tz.clone()),
-                );
+                self.now = self
+                    .timezone
+                    .as_ref()
+                    .map_or_else(Zoned::now, |tz| Zoned::now().with_time_zone(tz.clone()));
+                if self.now.date() != self.date_today {
+                    let old_date = self.date_today;
+                    self.date_today = self.now.date();
+                    self.date_selected = self.date_today;
+                    self.event_cache
+                        .invalidate(old_date.year(), old_date.month());
+                    self.event_cache
+                        .invalidate(self.date_today.year(), self.date_today.month());
+
+                    // Zero Idle IPC: only fetch if popup is open
+                    if self.popup.is_some() {
+                        return self.update(Message::FetchEvents(self.date_selected));
+                    }
+                }
                 Task::none()
             }
             Message::Rectangle(u) => {
@@ -583,6 +788,10 @@ impl cosmic::Application for Window {
             Message::SelectDay(day) => {
                 if let Ok(date) = self.date_selected.with().day(day).build() {
                     self.date_selected = date;
+                    self.selected_date_events = crate::event::filter_events_for_date(
+                        &self.month_events,
+                        self.date_selected,
+                    );
                 } else {
                     tracing::error!("invalid date");
                 }
@@ -591,16 +800,32 @@ impl cosmic::Application for Window {
             Message::PreviousMonth => {
                 if let Ok(date) = self.date_selected.checked_sub(1.month()) {
                     self.date_selected = date;
+                    self.load_month_events(date)
                 } else {
                     tracing::error!("invalid date");
+                    Task::none()
                 }
-                Task::none()
             }
             Message::NextMonth => {
                 if let Ok(date) = self.date_selected.checked_add(1.month()) {
                     self.date_selected = date;
+                    self.load_month_events(date)
                 } else {
                     tracing::error!("invalid date");
+                    Task::none()
+                }
+            }
+            Message::OpenUrl(safe_url) => {
+                if crate::event::is_safe_web_url(&safe_url) {
+                    let exec = format!("xdg-open {}", safe_url);
+                    if let Some(tx) = self.token_tx.as_ref() {
+                        let _ = tx.send(TokenRequest {
+                            app_id: Self::APP_ID.to_string(),
+                            exec,
+                        });
+                    } else {
+                        tracing::error!("Wayland tx is None");
+                    }
                 }
                 Task::none()
             }
@@ -624,9 +849,16 @@ impl cosmic::Application for Window {
                     TokenUpdate::Finished => {
                         self.token_tx = None;
                     }
-                    TokenUpdate::ActivationToken { token, .. } => {
-                        let mut cmd = std::process::Command::new("cosmic-settings");
-                        cmd.arg("time");
+                    TokenUpdate::ActivationToken { token, exec } => {
+                        let mut cmd = if let Some(url) = exec.strip_prefix("xdg-open ") {
+                            let mut c = std::process::Command::new("xdg-open");
+                            c.arg(url);
+                            c
+                        } else {
+                            let mut c = std::process::Command::new("cosmic-settings");
+                            c.arg("time");
+                            c
+                        };
                         if let Some(token) = token {
                             cmd.env("XDG_ACTIVATION_TOKEN", &token);
                             cmd.env("DESKTOP_STARTUP_ID", &token);
@@ -672,9 +904,30 @@ impl cosmic::Application for Window {
 
                 self.update(Message::Tick)
             }
-            Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Surface(a));
+            Message::FetchEvents(date) => self.load_month_events(date),
+            Message::EventsLoaded(date, result) => {
+                match result {
+                    Ok(events) => {
+                        self.event_cache
+                            .insert(date.year(), date.month(), events.clone());
+                        if self.date_selected.year() == date.year()
+                            && self.date_selected.month() == date.month()
+                        {
+                            self.apply_events_for_month(events);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "Failed to load calendar events");
+                        if self.date_selected.year() == date.year()
+                            && self.date_selected.month() == date.month()
+                        {
+                            self.is_loading_events = false;
+                        }
+                    }
+                }
+                Task::none()
             }
+            Message::Surface(a) => cosmic::task::message(cosmic::Action::Surface(a)),
         }
     }
 
@@ -752,6 +1005,8 @@ impl cosmic::Application for Window {
             .padding([12, 20]),
             calendar.padding([0, 12].into()),
             padded_control(divider::horizontal::default()).padding([space_xxs, space_s]),
+            container(self.events_view()).padding([0, 16]),
+            padded_control(divider::horizontal::default()).padding([space_xxs, space_s]),
             menu_button(text::body(fl!("datetime-settings")))
                 .on_press(Message::OpenDateTimeSettings),
         ]
@@ -768,7 +1023,13 @@ impl cosmic::Application for Window {
     }
 }
 
-fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<'static, Message> {
+fn date_button(
+    day: i8,
+    is_month: bool,
+    is_day: bool,
+    is_today: bool,
+    has_events: bool,
+) -> Button<'static, Message> {
     let style = if is_day {
         button::ButtonClass::Suggested
     } else if is_today {
@@ -777,14 +1038,22 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
         button::ButtonClass::Text
     };
 
-    let button = button::custom(
-        text::body(format!("{day}"))
-            .apply(container)
-            .center(Length::Fill),
-    )
-    .class(style)
-    .height(Length::Fixed(44.0))
-    .width(Length::Fixed(44.0));
+    let day_label = text::body(format!("{day}"));
+
+    let dot: Element<'static, Message> = if is_month && has_events {
+        icon::from_name("media-record-symbolic").size(6).into()
+    } else {
+        space::vertical().height(Length::Fixed(6.0)).into()
+    };
+
+    let content = column![day_label, dot]
+        .align_x(Alignment::Center)
+        .spacing(2);
+
+    let button = button::custom(content.apply(container).center(Length::Fill))
+        .class(style)
+        .height(Length::Fixed(44.0))
+        .width(Length::Fixed(44.0));
 
     if is_month {
         button.on_press(Message::SelectDay(day))
