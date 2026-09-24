@@ -18,6 +18,7 @@ TARGET_DIR="${HOME}/.local/bin"
 TARGET_BIN="${TARGET_DIR}/cosmic-applet-time"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_BIN="${REPO_ROOT}/target/release/cosmic-applet-time"
+PACKAGE_BIN="${REPO_ROOT}/cosmic-applet-time"
 GITHUB_REPO="Hasmolam/cosmic-applets"
 
 echo -e "${BLUE}${BOLD}=== COSMIC Time Applet with Calendar - Installer ===${NC}\n"
@@ -33,8 +34,17 @@ fi
 # 2. Determine installation source
 INSTALLED=0
 
-# Option A: Local compiled release binary in repo
-if [[ -f "${RELEASE_BIN}" && -x "${RELEASE_BIN}" ]]; then
+# Option A: Prebuilt binary in the same directory (extracted release package)
+if [[ -f "${PACKAGE_BIN}" ]]; then
+    echo -e "${BLUE}[*] Found cosmic-applet-time in release package.${NC}"
+    echo -e "    Installing from: ${PACKAGE_BIN}"
+    rm -f "${TARGET_BIN}"
+    cp "${PACKAGE_BIN}" "${TARGET_BIN}"
+    chmod +x "${TARGET_BIN}"
+    INSTALLED=1
+
+# Option B: Local compiled release binary in repo
+elif [[ -f "${RELEASE_BIN}" ]]; then
     echo -e "${BLUE}[*] Found locally compiled release binary.${NC}"
     echo -e "    Installing from: ${RELEASE_BIN}"
     rm -f "${TARGET_BIN}"
@@ -42,7 +52,7 @@ if [[ -f "${RELEASE_BIN}" && -x "${RELEASE_BIN}" ]]; then
     chmod +x "${TARGET_BIN}"
     INSTALLED=1
 
-# Option B: Build from source if cargo is available
+# Option C: Build from source if cargo is available
 elif command -v cargo &>/dev/null && [[ -f "${REPO_ROOT}/Cargo.toml" ]]; then
     echo -e "${BLUE}[*] Cargo detected. Building cosmic-applet-time with --release...${NC}"
     (cd "${REPO_ROOT}" && cargo build --release -p cosmic-applet-time)
@@ -51,7 +61,7 @@ elif command -v cargo &>/dev/null && [[ -f "${REPO_ROOT}/Cargo.toml" ]]; then
     chmod +x "${TARGET_BIN}"
     INSTALLED=1
 
-# Option C: Download latest pre-built binary from GitHub Releases
+# Option D: Download latest pre-built binary from GitHub Releases
 else
     echo -e "${BLUE}[*] Downloading latest pre-built binary from GitHub Releases...${NC}"
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/cosmic-applet-time"

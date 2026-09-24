@@ -98,10 +98,14 @@ impl CalendarBackend for LocalIcsBackend {
             for path in &self.file_paths {
                 if path.exists() {
                     match tokio::fs::read_to_string(path).await {
-                        Ok(content) => {
-                            let parsed = parse_ical_content(&content, start, end)?;
-                            all_events.extend(parsed);
-                        }
+                        Ok(content) => match parse_ical_content(&content, start, end) {
+                            Ok(parsed) => {
+                                all_events.extend(parsed);
+                            }
+                            Err(err) => {
+                                tracing::warn!(?err, path = ?path, "Skipping corrupted calendar file");
+                            }
+                        },
                         Err(err) => {
                             tracing::warn!(?err, path = ?path, "Failed to read calendar file");
                         }
@@ -143,9 +147,71 @@ impl CalendarBackend for CompositeBackend {
                     }
                 }
             }
-            combined.sort_by(|a, b| a.start.cmp(&b.start));
-            combined.dedup_by(|a, b| !a.id.is_empty() && a.id == b.id);
-            Ok(combined)
+
+            // Sort chronologically: start, end, normalized summary, ID
+            combined.sort_by(|a, b| {
+                a.start
+                    .cmp(&b.start)
+                    .then_with(|| a.end.cmp(&b.end))
+                    .then_with(|| {
+                        a.summary
+                            .trim()
+                            .to_lowercase()
+                            .cmp(&b.summary.trim().to_lowercase())
+                    })
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            // Robust multi-backend deduplication:
+            // 1. Matches identical non-empty UIDs
+            // 2. Matches events occurring at the exact same time with matching summary
+            // 3. Merges metadata (URL, location) into the retained event
+            let mut deduplicated: Vec<CalendarEvent> = Vec::with_capacity(combined.len());
+
+            for event in combined {
+                let mut duplicate_found = false;
+
+                for existing in &mut deduplicated {
+                    let id_match =
+                        !existing.id.is_empty() && !event.id.is_empty() && existing.id == event.id;
+
+                    let time_and_summary_match = existing.is_all_day == event.is_all_day
+                        && existing.start == event.start
+                        && existing.end == event.end
+                        && existing
+                            .summary
+                            .trim()
+                            .eq_ignore_ascii_case(event.summary.trim());
+
+                    let all_day_holiday_match = existing.is_all_day
+                        && event.is_all_day
+                        && existing.start.date() == event.start.date()
+                        && existing
+                            .summary
+                            .trim()
+                            .eq_ignore_ascii_case(event.summary.trim());
+
+                    if id_match || time_and_summary_match || all_day_holiday_match {
+                        duplicate_found = true;
+                        if existing.url.is_none() && event.url.is_some() {
+                            existing.url = event.url.clone();
+                        }
+                        if existing.location.is_none() && event.location.is_some() {
+                            existing.location = event.location.clone();
+                        }
+                        if existing.id.is_empty() && !event.id.is_empty() {
+                            existing.id = event.id.clone();
+                        }
+                        break;
+                    }
+                }
+
+                if !duplicate_found {
+                    deduplicated.push(event);
+                }
+            }
+
+            Ok(deduplicated)
         })
     }
 }
@@ -228,5 +294,111 @@ END:VCALENDAR";
         for w in events.windows(2) {
             assert!(w[0].start <= w[1].start);
         }
+    }
+
+    #[tokio::test]
+    async fn test_local_ics_backend_skips_corrupted_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let broken_path = temp_dir.path().join("broken.ics");
+        let valid_path = temp_dir.path().join("valid.ics");
+
+        // Write corrupted file (exceeds MAX_ICAL_BYTES or malformed)
+        std::fs::write(&broken_path, "NOT_AN_ICAL_FILE_CORRUPTED").unwrap();
+
+        let valid_ics = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\n\
+UID:valid-evt-1\r\n\
+SUMMARY:Valid Standup\r\n\
+DTSTART:20260410T090000Z\r\n\
+DTEND:20260410T093000Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        std::fs::write(&valid_path, valid_ics).unwrap();
+
+        // LocalIcsBackend should skip broken.ics and successfully load valid.ics
+        let backend = LocalIcsBackend::new(vec![broken_path, valid_path]);
+        let events = backend
+            .fetch_events(date(2026, 4, 1), date(2026, 4, 30))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "Valid Standup");
+    }
+
+    #[tokio::test]
+    async fn test_composite_backend_same_hour_deduplication() {
+        use jiff::civil::time;
+        let tz = jiff::tz::TimeZone::UTC;
+
+        let d10 = date(2026, 4, 10).to_zoned(tz.clone()).unwrap();
+        let start_10am = d10.with().time(time(10, 0, 0, 0)).build().unwrap();
+        let end_11am = d10.with().time(time(11, 0, 0, 0)).build().unwrap();
+        let end_1030am = d10.with().time(time(10, 30, 0, 0)).build().unwrap();
+
+        // Three events at the same 10:00 AM hour:
+        // - Event 1: Team Standup (id: "standup-1")
+        // - Event 2: Dentist (id: "dentist-1")
+        // - Event 3: Duplicate of Event 1 (different ID or same, but same hour)
+        let ev1 = CalendarEvent {
+            id: "standup-1".to_string(),
+            summary: "Team Standup".to_string(),
+            start: start_10am.clone(),
+            end: end_1030am.clone(),
+            is_all_day: false,
+            location: None,
+            url: Some("https://meet.google.com/abc".to_string()),
+        };
+
+        let ev2 = CalendarEvent {
+            id: "dentist-1".to_string(),
+            summary: "Dentist Appointment".to_string(),
+            start: start_10am.clone(),
+            end: end_11am.clone(),
+            is_all_day: false,
+            location: Some("Clinic".to_string()),
+            url: None,
+        };
+
+        let ev1_duplicate = CalendarEvent {
+            id: "standup-from-ics".to_string(),   // different ID!
+            summary: "team standup ".to_string(), // case & whitespace variation
+            start: start_10am.clone(),
+            end: end_1030am.clone(),
+            is_all_day: false,
+            location: Some("Online Room 1".to_string()),
+            url: None,
+        };
+
+        struct CustomBackend(Vec<CalendarEvent>);
+        impl CalendarBackend for CustomBackend {
+            fn fetch_events<'a>(
+                &'a self,
+                _start: Date,
+                _end: Date,
+            ) -> BoxFuture<'a, Result<Vec<CalendarEvent>, CalendarError>> {
+                Box::pin(async move { Ok(self.0.clone()) })
+            }
+        }
+
+        let b1 = std::sync::Arc::new(CustomBackend(vec![ev1, ev2]));
+        let b2 = std::sync::Arc::new(CustomBackend(vec![ev1_duplicate]));
+        let composite = CompositeBackend::new(vec![b1, b2]);
+
+        let events = composite
+            .fetch_events(date(2026, 4, 1), date(2026, 4, 30))
+            .await
+            .unwrap();
+
+        // Should deduplicate ev1 and ev1_duplicate, while keeping ev2 (Dentist)!
+        assert_eq!(events.len(), 2);
+        let summaries: Vec<&str> = events.iter().map(|e| e.summary.as_str()).collect();
+        assert!(summaries.contains(&"Team Standup"));
+        assert!(summaries.contains(&"Dentist Appointment"));
+
+        // Verify URL from ev1 and location from ev1_duplicate were merged!
+        let standup = events.iter().find(|e| e.summary == "Team Standup").unwrap();
+        assert_eq!(standup.url, Some("https://meet.google.com/abc".to_string()));
+        assert_eq!(standup.location, Some("Online Room 1".to_string()));
     }
 }
