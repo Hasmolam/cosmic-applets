@@ -1,5 +1,9 @@
 # cosmic-applet-time (with calendar events)
 
+> [!IMPORTANT]
+> **Active Development Moved:** This calendar integration has been decoupled from the 15-applet monorepo into an independent, standalone repository: [**cosmic-ext-applet-calendar**](https://github.com/Hasmolam/cosmic-ext-applet-calendar).
+> Please use the new repository for lightweight installation, prebuilt binaries, and issue tracking.
+
 A modified build of Pop!_OS `cosmic-applet-time` that adds calendar event indicators and an agenda view to the panel clock popup.
 
 It pulls events from local `.ics` files and existing accounts configured through Evolution Data Server (EDS), without running background sync daemons inside the applet.
