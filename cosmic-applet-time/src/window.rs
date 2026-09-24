@@ -413,9 +413,7 @@ impl Window {
             events_col = events_col.push(container(event_row).padding(space_xs));
         }
 
-        container(scrollable(events_col))
-            .max_height(200.0)
-            .into()
+        container(scrollable(events_col)).max_height(200.0).into()
     }
 
     fn apply_events_for_month(&mut self, events: Vec<crate::event::CalendarEvent>) {
